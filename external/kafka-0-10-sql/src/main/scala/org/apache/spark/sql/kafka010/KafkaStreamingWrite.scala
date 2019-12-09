@@ -93,6 +93,7 @@ private[kafka010] class KafkaTransactionStreamingWrite(
       val metaDatas = messages.map(_.asInstanceOf[ProducerTransactionMetaData])
       metaDataLog.add(epochId, metaDatas)
 
+      // TODO: resume producer
       val config = new ju.HashMap[String, Object]()
       config.putAll(producerParams)
       val sparkSession = SparkSession.getActiveSession.get
@@ -127,38 +128,7 @@ private[kafka010] class KafkaTransactionStreamingWrite(
     }
   }
 
-  override def abort(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {
-    val sparkSession = SparkSession.getActiveSession.get
-    val batchId = KafkaTransactionStreamingWrite.getCurrentBatchId(producerParams, sparkSession)
-    val metaData = metaDataLog.get(batchId)
-    val needAbort = messages.nonEmpty && messages.head.isInstanceOf[ProducerTransactionMetaData] &&
-      metaData.isEmpty
-    if (needAbort) {
-      val metaDatas = messages.map(_.asInstanceOf[ProducerTransactionMetaData])
-      val config = new ju.HashMap[String, Object]()
-      config.putAll(producerParams)
-      val aliveExecutors = KafkaTransactionStreamingWrite.getExecutors(sparkSession)
-      val executorNum = if (aliveExecutors.nonEmpty) aliveExecutors.size else 1
-      val executorMetaData = metaDatas.groupBy(
-        metaData => ProducerTransactionMetaData.toExecutorId(metaData.transactionalId))
-      sparkSession.sparkContext
-        .parallelize( 0 until executorNum, executorNum)
-        .foreach(_ => {
-          val executorId = SparkEnv.get.executorId
-          if (executorMetaData.contains(executorId)) {
-            executorMetaData(executorId).foreach(metaData => {
-              config.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, metaData.transactionalId)
-              val producer = CachedKafkaProducer.getOrCreate(config)
-              try {
-                producer.abortTransaction()
-              } finally {
-                producer.close(Duration.ofSeconds(0))
-              }
-            })
-          }
-        })
-    }
-  }
+  override def abort(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {}
 
   override def getOptionalPartitionNum: Integer = {
     if (producerParams.containsKey(KafkaTransactionStreamingWrite.PRODUCER_CREATE_FACTOR_CONFIG)) {
@@ -320,6 +290,7 @@ private[kafka010] object KafkaTransactionStreamingWrite {
       userDefinedTransId + ju.UUID.randomUUID().toString
   }
 
+  // TODO: delete
   def getExecutors(sparkSession: SparkSession): Seq[BlockManagerId] = {
     val blockManager = sparkSession.sparkContext.env.blockManager
     blockManager.master.getPeers(blockManager.blockManagerId)

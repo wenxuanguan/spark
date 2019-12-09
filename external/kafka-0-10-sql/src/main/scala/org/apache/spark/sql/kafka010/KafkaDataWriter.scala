@@ -130,15 +130,6 @@ private[kafka010] class KafkaTransactionDataWriter(
       })
     }
   }
-
-  def close(): Unit = {
-    checkForErrors()
-    if (producer != null) {
-      producer.flush()
-      checkForErrors()
-      CachedKafkaProducer.close(producerParams)
-    }
-  }
 }
 
 /**
@@ -165,12 +156,6 @@ private[kafka010] class KafkaTransactionResumeDataWriter(
   }
 
   def abort(): Unit = {}
-
-  def close(): Unit = {
-    if (producer != null) {
-      CachedKafkaProducer.close(producerParams)
-    }
-  }
 }
 
 /**
