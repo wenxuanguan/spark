@@ -72,21 +72,25 @@ public class InternalKafkaProducer<K, V> implements Producer<K, V> {
 
   @Override
   public void initTransactions() {
+    printState("init");
     kafkaProducer.initTransactions();
   }
 
   @Override
   public void beginTransaction() throws ProducerFencedException {
+    printState("begin");
     kafkaProducer.beginTransaction();
   }
 
   @Override
   public void commitTransaction() throws ProducerFencedException {
+    printState("commit");
     kafkaProducer.commitTransaction();
   }
 
   @Override
   public void abortTransaction() throws ProducerFencedException {
+    printState("abort");
     kafkaProducer.abortTransaction();
   }
 
@@ -103,6 +107,7 @@ public class InternalKafkaProducer<K, V> implements Producer<K, V> {
 
   @Override
   public Future<RecordMetadata> send(ProducerRecord<K, V> record, Callback callback) {
+    printState("send");
     return kafkaProducer.send(record, callback);
   }
 
@@ -133,6 +138,7 @@ public class InternalKafkaProducer<K, V> implements Producer<K, V> {
 
   @Override
   public void flush() {
+    printState("flush");
     kafkaProducer.flush();
   }
 
@@ -145,7 +151,8 @@ public class InternalKafkaProducer<K, V> implements Producer<K, V> {
   public void resumeTransaction(long producerId, short epoch) {
     Preconditions.checkState(producerId >= 0 && epoch >= 0,
         "Incorrect values for producerId %s and epoch %s", producerId, epoch);
-    LOG.info("Attempting to resume transaction {} with producerId {} and epoch {}",
+    // for test
+    LOG.warn("Attempting to resume transaction {} with producerId {} and epoch {}",
         transactionalId, producerId, epoch);
 
     Object transactionManager = getValue(kafkaProducer, "transactionManager");
@@ -180,6 +187,17 @@ public class InternalKafkaProducer<K, V> implements Producer<K, V> {
     Object transactionManager = getValue(kafkaProducer, "transactionManager");
     Object producerIdAndEpoch = getValue(transactionManager, "producerIdAndEpoch");
     return (short) getValue(producerIdAndEpoch, "epoch");
+  }
+
+  public String getState() {
+    Object transactionManager = getValue(kafkaProducer, "transactionManager");
+    Enum currentState = (Enum) getValue(transactionManager, "currentState");
+    return currentState.name();
+  }
+
+  public boolean isTxnStarted() {
+    Object transactionManager = getValue(kafkaProducer, "transactionManager");
+    return (Boolean) getValue(transactionManager, "transactionStarted");
   }
 
   @VisibleForTesting
@@ -245,5 +263,10 @@ public class InternalKafkaProducer<K, V> implements Producer<K, V> {
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new RuntimeException("Incompatible KafkaProducer version", e);
     }
+  }
+
+  public void printState(String action) {
+    LOG.warn("###Thread:{} run {}, current state:{}, transId: {}, producerId: {}, epoch:{}.",
+            Thread.currentThread().getName(), action, getState(), transactionalId, getProducerId(), getEpoch());
   }
 }

@@ -21,11 +21,14 @@ import java.{util => ju}
 import java.util.concurrent.atomic.AtomicInteger
 
 import com.google.common.cache._
-
+import org.apache.spark.TaskContext
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.sources.v2.writer._
 import org.apache.spark.util.Utils
+
+import scala.util.control.NonFatal
 
 /**
  * A [[WriterCommitMessage]] for Kafka commit message.
@@ -39,6 +42,11 @@ private[kafka010] case class ProducerTransactionMetaData(
     producerId: Long)
   extends WriterCommitMessage
 
+private[kafka010] case class ErrorCommitMessage(
+    transactionalId: String,
+    epoch: Short,
+    producerId: Long)extends WriterCommitMessage
+
 /**
  * Emtpy commit message for resume transaction.
  */
@@ -49,9 +57,9 @@ private[kafka010] case object ProducerTransactionMetaData {
 
   def toTransactionId(
       executorId: String,
-      taskIndex: String,
+      partitionId: String,
       transactionalIdSuffix: String): String = {
-    toTransactionId(toProducerIdentity(executorId, taskIndex), transactionalIdSuffix)
+    toTransactionId(toProducerIdentity(executorId, partitionId), transactionalIdSuffix)
   }
 
   def toTransactionId(producerIdentity: String, transactionalIdSuffix: String): String = {
@@ -71,13 +79,13 @@ private[kafka010] case object ProducerTransactionMetaData {
     producerIdentity.split("-", 2)(0)
   }
 
-  def toTaskIndex(transactionalId: String): String = {
+  def toPartitionId(transactionalId: String): String = {
     val producerIdentity = toProducerIdentity(transactionalId)
     producerIdentity.split("-", 2)(1)
   }
 
-  def toProducerIdentity(executorId: String, taskIndex: String): String = {
-    s"$executorId-$taskIndex"
+  def toProducerIdentity(executorId: String, partitionId: String): String = {
+    s"$executorId-$partitionId"
   }
 }
 
@@ -101,6 +109,9 @@ private[kafka010] class KafkaTransactionDataWriter(
     if (kafkaProducer.getProducerId == -1) {
       kafkaProducer.initTransactions()
     }
+    if (kafkaProducer.getState == "IN_TRANSACTION") {
+      kafkaProducer.commitTransaction()
+    }
     kafkaProducer.beginTransaction()
     kafkaProducer
   }
@@ -108,6 +119,21 @@ private[kafka010] class KafkaTransactionDataWriter(
   def write(row: InternalRow): Unit = {
     checkForErrors()
     sendRow(row, producer)
+    // for test
+    import org.apache.spark.TaskContext
+    val taskId = TaskContext.get().taskAttemptId()
+    if (taskId % 10 == 1) {
+      // scalastyle:off println
+      val now = System.currentTimeMillis()
+      if (producerParams.containsKey("test.timestamp0")) {
+        val start = producerParams.get("test.timestamp0").toString.toLong
+        val end = start + 1000 * 10
+        if (now > start && now < end) {
+          throw new Exception("***for test0")
+        }
+      }
+    }
+    // end test
   }
 
   def commit(): WriterCommitMessage = {
@@ -117,18 +143,31 @@ private[kafka010] class KafkaTransactionDataWriter(
     checkForErrors()
     producer.flush()
     checkForErrors()
-    ProducerTransactionMetaData(producer.getTransactionalId, producer.getEpoch,
-      producer.getProducerId)
+    val transactionSuffix =
+      ProducerTransactionMetaData.toTransactionalIdSuffix(producer.getTransactionalId)
+//    TaskIndexGenerator.resetTaskIndex(transactionSuffix)
+
+    // Transaction is started only after send record to Kafka.
+    if (producer.isTxnStarted) {
+      ProducerTransactionMetaData(producer.getTransactionalId, producer.getEpoch,
+        producer.getProducerId)
+    } else {
+      EmptyCommitMessage
+    }
   }
 
   def abort(): Unit = {
-    if (producer.getProducerId != -1) {
       Utils.tryWithSafeFinallyAndFailureCallbacks(block = {
-        producer.abortTransaction()
-      })(catchBlock = {
+        if (producer.getState == "IN_TRANSACTION") {
+          System.err.println(s"starting abort transaction, transId:${producer.transactionalId}," +
+            s" task:${TaskContext.get().taskAttemptId()}")
+          producer.abortTransaction()
+          System.err.println(s"finish abort transaction, transId:${producer.transactionalId}," +
+            s" task:${TaskContext.get().taskAttemptId()}")
+        }
+      })(finallyBlock = {
         CachedKafkaProducer.close(producerParams)
       })
-    }
   }
 }
 
@@ -142,17 +181,22 @@ private[kafka010] class KafkaTransactionResumeDataWriter(
     producerParams: ju.Map[String, Object],
     inputSchema: Seq[Attribute],
     metaData: ProducerTransactionMetaData)
-  extends KafkaRowWriter(inputSchema, targetTopic) with DataWriter[InternalRow] {
+  extends KafkaRowWriter(inputSchema, targetTopic) with DataWriter[InternalRow] with Logging {
 
   private val producer = CachedKafkaProducer.getOrCreate(producerParams)
 
   def write(row: InternalRow): Unit = {}
 
   def commit(): WriterCommitMessage = {
-    producer.resumeTransaction(metaData.producerId, metaData.epoch)
-    producer.commitTransaction()
-
-    EmptyCommitMessage
+    try {
+      producer.resumeTransaction(metaData.producerId, metaData.epoch)
+      producer.commitTransaction()
+      EmptyCommitMessage
+    } catch {
+      case NonFatal(t) =>
+        logError("Fail to resume and commit transaction.", t)
+        ErrorCommitMessage(producer.transactionalId, producer.getEpoch, producer.getProducerId)
+    }
   }
 
   def abort(): Unit = {}

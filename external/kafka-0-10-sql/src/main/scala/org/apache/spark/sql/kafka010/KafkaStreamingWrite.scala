@@ -18,7 +18,6 @@
 package org.apache.spark.sql.kafka010
 
 import java.{util => ju}
-import java.time.Duration
 
 import org.apache.hadoop.fs.Path
 import org.apache.kafka.clients.producer.ProducerConfig
@@ -33,6 +32,7 @@ import org.apache.spark.sql.sources.v2.writer._
 import org.apache.spark.sql.sources.v2.writer.streaming.{StreamingDataWriterFactory, StreamingWrite}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.storage.BlockManagerId
+import org.apache.spark.util.Utils
 
 /**
  * A [[StreamingWrite]] for Kafka transactional writing. Responsible for generating
@@ -49,7 +49,7 @@ private[kafka010] class KafkaTransactionStreamingWrite(
     schema: StructType)
   extends StreamingWrite with Logging {
   private var initialized = false
-  private lazy val transactionalIdSuffix: String =
+  private var transactionalIdSuffix: String =
     KafkaTransactionStreamingWrite.generateTransactionIdSuffix(producerParams)
   private lazy val metaDataLog = {
     val sparkSession = SparkSession.getActiveSession.get
@@ -67,19 +67,35 @@ private[kafka010] class KafkaTransactionStreamingWrite(
       val writerFactory = {
         val sparkSession = SparkSession.getActiveSession.get
         val batchId = KafkaTransactionStreamingWrite.getCurrentBatchId(producerParams, sparkSession)
-        val metaData = metaDataLog.get(batchId)
-
-        if (batchId == 0 || metaData.isEmpty) {
+        val latestLog = metaDataLog.getLatest()
+        // TODO: log wanr if user defined transaction id not equal to stored in hdfs
+        
+        if (latestLog.isEmpty) {
           KafkaTransactionStreamWriterFactory(topic, producerParams, schema,
             transactionalIdSuffix)
         } else {
+          val latestBatchId = latestLog.get._1
+          val metaData = latestLog.get._2
+          if (latestBatchId > batchId) {
+            // TODO: 参考HDFS meta data有问题
+            throw new Exception("metadata corrupted.")
+          }
 
-          // restart and commit transaction since fail to commit transaction
-          val resumedTransId = metaData.get.head.transactionalId
-          val resumedTranslIdSuffix =
-            ProducerTransactionMetaData.toTransactionalIdSuffix(resumedTransId)
-          KafkaStreamTransactionResumeWriterFactory(topic, producerParams, schema,
-            resumedTranslIdSuffix, metaData.get)
+          if (latestLog.get._1 < batchId) {
+            val tranId = metaData.head.transactionalId
+            transactionalIdSuffix = ProducerTransactionMetaData.toTransactionalIdSuffix(tranId)
+            KafkaTransactionStreamWriterFactory(topic, producerParams, schema,
+              transactionalIdSuffix)
+          } else {
+            // for test
+            System.err.println("###start to resume")
+            //
+            val resumedTransId = metaData.head.transactionalId
+            val resumedTranslIdSuffix =
+              ProducerTransactionMetaData.toTransactionalIdSuffix(resumedTransId)
+            KafkaStreamTransactionResumeWriterFactory(topic, producerParams, schema,
+              resumedTranslIdSuffix, metaData)
+          }
         }
       }
       initialize()
@@ -88,13 +104,78 @@ private[kafka010] class KafkaTransactionStreamingWrite(
   }
 
   override def commit(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {
-    val needCommit = messages.nonEmpty && messages.head.isInstanceOf[ProducerTransactionMetaData]
+    // for test
+    if (producerParams.containsKey("test.timestamp1")) {
+      val now = System.currentTimeMillis()
+      val start = producerParams.get("test.timestamp1").toString.toLong
+      val end = start + 1000 * 10
+      if (now > start && now < end) {
+        throw new Exception("***for test1")
+      }
+    }
+    // end test
+
+    val errorcommit = messages.exists(_.isInstanceOf[ErrorCommitMessage])
+    if (errorcommit) {
+      // TODO: add producer meta in exception
+      throw new Exception("Fail to resume transaction.")
+    }
+
+    val needCommit = messages.nonEmpty &&
+      messages.exists(_.isInstanceOf[ProducerTransactionMetaData])
     if (needCommit) {
-      val metaDatas = messages.map(_.asInstanceOf[ProducerTransactionMetaData])
+      val metaDatas = messages.filter(_.isInstanceOf[ProducerTransactionMetaData])
+        .map(_.asInstanceOf[ProducerTransactionMetaData])
       metaDataLog.add(epochId, metaDatas)
 
-      // TODO: resume producer
-      val config = new ju.HashMap[String, Object]()
+      // for test
+      if (producerParams.containsKey("test.timestamp2")) {
+        val now = System.currentTimeMillis()
+        val start = producerParams.get("test.timestamp2").toString.toLong
+        val end = start + 1000 * 10
+        if (now > start && now < end) {
+          throw new Exception("***for test2")
+        }
+      }
+      // end test
+
+      // TODO: threadpool and fail if get exception
+      // for test add annotation
+      /*metaDatas.foreach(metaData => {
+        // TODO: CachedKafkaProducer.getOrCreate extra 操作
+        val config = new ju.HashMap[String, Object]()
+        config.putAll(producerParams)
+        config.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, metaData.transactionalId)
+        val producer = new InternalKafkaProducer(config)
+        producer.resumeTransaction(metaData.producerId, metaData.epoch)
+        producer.commitTransaction()
+      })*/
+      // for test
+      metaDatas.zipWithIndex.foreach{case (metaData, index) =>
+        if (producerParams.containsKey("test.timestamp3") && index % 2 == 1) {
+
+            val now = System.currentTimeMillis()
+            val start = producerParams.get("test.timestamp3").toString.toLong
+            val end = start + 1000 * 10
+            if (now > start && now < end) {
+              throw new Exception("***for test3")
+            }
+
+        }
+        val config = new ju.HashMap[String, Object]()
+        config.putAll(producerParams)
+        config.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, metaData.transactionalId)
+        val producer = new InternalKafkaProducer(config)
+        System.err.println(s"start to resumt. meta:${metaData}")
+        producer.resumeTransaction(metaData.producerId, metaData.epoch)
+        System.err.println(s"finish resume. meta:${metaData}")
+        System.err.println(s"start to commit. meta:${metaData}")
+        producer.commitTransaction()
+        System.err.println(s"finish commit. meta:${metaData}")
+      }
+      //
+
+      /*val config = new ju.HashMap[String, Object]()
       config.putAll(producerParams)
       val sparkSession = SparkSession.getActiveSession.get
       val aliveExecutors = KafkaTransactionStreamingWrite.getExecutors(sparkSession)
@@ -124,11 +205,41 @@ private[kafka010] class KafkaTransactionStreamingWrite(
         throw new Exception("Fail to commit the writing job, " +
           s"since kafka producer failed to commit transaction in " +
           s"executor[${failedExecutors.mkString(",")}].")
-      }
+      }*/
     }
   }
 
-  override def abort(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {}
+  override def abort(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {
+    val sparkSession = SparkSession.getActiveSession.get
+    val batchId = KafkaTransactionStreamingWrite.getCurrentBatchId(producerParams, sparkSession)
+    val metaData = metaDataLog.get(batchId)
+    val needAbort = messages.nonEmpty && messages.head.isInstanceOf[ProducerTransactionMetaData] &&
+      metaData.isEmpty
+    if (needAbort) {
+      val metaDatas = messages.filter(_.isInstanceOf[ProducerTransactionMetaData])
+        .map(_.asInstanceOf[ProducerTransactionMetaData])
+
+      metaDatas.foreach(metaData => {
+        // TODO: CachedKafkaProducer.getOrCreate extra 操作
+        val config = new ju.HashMap[String, Object]()
+        config.putAll(producerParams)
+        config.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, metaData.transactionalId)
+        val producer = new InternalKafkaProducer(config)
+        producer.resumeTransaction(metaData.producerId, metaData.epoch)
+
+        // TODO: add to Utils
+        import util.control.NonFatal
+        try {
+          producer.abortTransaction()
+        } catch {
+          case NonFatal(t) =>
+            logError(s"Uncaught exception in thread ${Thread.currentThread().getName}", t)
+        } finally {
+          producer.close()
+        }
+      })
+    }
+  }
 
   override def getOptionalPartitionNum: Integer = {
     if (producerParams.containsKey(KafkaTransactionStreamingWrite.PRODUCER_CREATE_FACTOR_CONFIG)) {
@@ -205,8 +316,8 @@ private case class KafkaTransactionStreamWriterFactory(
       taskId: Long,
       epochId: Long): DataWriter[InternalRow] = {
     val executorId = SparkEnv.get.executorId
-    val taskIndex = TaskIndexGenerator.getTaskIndex(transactionSuffix)
-    val transactionalId = ProducerTransactionMetaData.toTransactionId(executorId, taskIndex,
+//    val taskIndex = TaskIndexGenerator.getTaskIndex(transactionSuffix)
+    val transactionalId = ProducerTransactionMetaData.toTransactionId(executorId, partitionId.toString,
       transactionSuffix)
     producerParams.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, transactionalId)
     new KafkaTransactionDataWriter(topic, producerParams, schema.toAttributes)
@@ -233,7 +344,7 @@ private case class KafkaStreamTransactionResumeWriterFactory(
       partitionId: Int,
       taskId: Long,
       epochId: Long): DataWriter[InternalRow] = {
-    val metaData: ProducerTransactionMetaData = metaDatas(taskId.toInt)
+    val metaData: ProducerTransactionMetaData = metaDatas(partitionId)
     producerParams.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, metaData.transactionalId)
     new KafkaTransactionResumeDataWriter(topic, producerParams, schema.toAttributes, metaData)
   }
