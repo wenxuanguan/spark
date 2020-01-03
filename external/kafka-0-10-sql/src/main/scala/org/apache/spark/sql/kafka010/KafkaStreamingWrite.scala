@@ -32,7 +32,6 @@ import org.apache.spark.sql.sources.v2.writer._
 import org.apache.spark.sql.sources.v2.writer.streaming.{StreamingDataWriterFactory, StreamingWrite}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.storage.BlockManagerId
-import org.apache.spark.util.Utils
 
 /**
  * A [[StreamingWrite]] for Kafka transactional writing. Responsible for generating
@@ -316,6 +315,9 @@ private case class KafkaTransactionStreamWriterFactory(
       taskId: Long,
       epochId: Long): DataWriter[InternalRow] = {
     val executorId = SparkEnv.get.executorId
+    import org.apache.spark.TaskContext
+    val taskAttempt = TaskContext.get().attemptNumber()
+    // TODO: get transaction id from queue or create one if queue.poll() == null or task taskAttempt > 0
 //    val taskIndex = TaskIndexGenerator.getTaskIndex(transactionSuffix)
     val transactionalId = ProducerTransactionMetaData.toTransactionId(executorId, partitionId.toString,
       transactionSuffix)

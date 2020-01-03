@@ -17,9 +17,11 @@
 
 package org.apache.spark.sql.kafka010
 
-import java.{util => ju}
+import java.util.concurrent.LinkedBlockingQueue
+import java.{util, util => ju}
 import java.util.concurrent.atomic.AtomicInteger
 
+import scala.util.control.NonFatal
 import com.google.common.cache._
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
@@ -27,8 +29,6 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.sources.v2.writer._
 import org.apache.spark.util.Utils
-
-import scala.util.control.NonFatal
 
 /**
  * A [[WriterCommitMessage]] for Kafka commit message.
@@ -147,6 +147,8 @@ private[kafka010] class KafkaTransactionDataWriter(
       ProducerTransactionMetaData.toTransactionalIdSuffix(producer.getTransactionalId)
 //    TaskIndexGenerator.resetTaskIndex(transactionSuffix)
 
+    // TODO: queue.offer()
+
     // Transaction is started only after send record to Kafka.
     if (producer.isTxnStarted) {
       ProducerTransactionMetaData(producer.getTransactionalId, producer.getEpoch,
@@ -246,7 +248,7 @@ private[kafka010] class KafkaDataWriter(
   }
 }
 
-
+// TODO: replaced by LinkedBlokingQueue
 private object TaskIndexGenerator {
   private val generator = CacheBuilder.newBuilder().build[String, AtomicInteger](
     new CacheLoader[String, AtomicInteger] {
